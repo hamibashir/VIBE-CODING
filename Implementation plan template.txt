@@ -1,0 +1,118 @@
+# Implementation Plan: Task 4.5 - Media Upload API Endpoint
+
+## 1. Task Objective
+Implement the production-ready media upload endpoint [`POST /api/v1/upload`](file:///C:/Users/Admin/Desktop/Classified-ads/server/src/routes/uploadRoutes.ts) that accepts multipart image uploads (up to 8 files under the `images` field), authenticates the user session, processes the memory buffers through [`storageService.ts`](file:///C:/Users/Admin/Desktop/Classified-ads/server/src/services/storageService.ts) (saving locally or streaming to Cloudinary according to configuration), and returns standardized JSON containing the array of generated URLs and asset descriptors. This completes **Phase 4: Media Storage Pipeline & Image Processing**.
+
+---
+
+## 2. Relevant Files & Areas to Inspect or Modify
+- **New Controller (`server/src/controllers/uploadController.ts`):**
+  - Implement `uploadImagesHandler`: validates that `req.files` contains at least 1 file; invokes `uploadFile()` for each uploaded buffer concurrently via `Promise.all`; returns `201 Created` with `{ urls, images }`.
+  - Implement `uploadSingleImageHandler`: helper for single-file uploads (`req.file`).
+- **New Route File (`server/src/routes/uploadRoutes.ts`):**
+  - Define router mounting `POST /` with `authenticateUser`, `uploadImages`, and `uploadImagesHandler`.
+  - Mount `POST /single` with `authenticateUser`, `uploadSingleImage`, and `uploadSingleImageHandler`.
+- **Server Bootstrap (`server/src/index.ts`):**
+  - Mount `uploadRoutes` under `/api/v1/upload`.
+
+---
+
+## 3. Implementation Approach
+
+```
++------------------------------------------------------------------------+
+| Client: POST /api/v1/upload (multipart/form-data: images=[file1, ...])|
++------------------------------------------------------------------------+
+                                    |
+                                    v
+                   +----------------------------------+
+                   |  1. authenticateUser Middleware  |
+                   +----------------------------------+
+                     /                              \
+          No/Invalid JWT                         Valid JWT
+                   /                                  \
+                  v                                    v
+          401 UNAUTHORIZED               +---------------------------+
+                                         | 2. uploadImages Middleware |
+                                         +---------------------------+
+                                           /                       \
+                                   Validation Error              Valid
+                                         /                           \
+                                        v                             v
+                                  400 Bad Request          +----------------------+
+                                                           | 3. uploadController  |
+                                                           +----------------------+
+                                                                      |
+                                                                      v
+                                                           +----------------------+
+                                                           | 4. storageService    |
+                                                           |    uploadFile()      |
+                                                           +----------------------+
+                                                                      |
+                                                                      v
+                                                           +----------------------+
+                                                           | 5. 201 Created       |
+                                                           |    { urls, images }  |
+                                                           +----------------------+
+```
+
+1. **Create Controller (`uploadController.ts`):**
+   - Check if `req.files` is empty or missing $\rightarrow$ `sendError(res, 'NO_FILES_PROVIDED', 'Please provide at least one image to upload', undefined, 400)`.
+   - Map each file buffer to `uploadFile(file.buffer, file.originalname, file.mimetype)`.
+   - Wrap in `try/catch` with automated rollback: if an error occurs mid-batch, delete any files already saved to disk/cloud in that batch to prevent orphaned storage.
+   - Return `sendSuccess(res, { urls, images }, 'Images uploaded successfully', 201)`.
+2. **Create Routes (`uploadRoutes.ts`):**
+   - Route `POST /` $\rightarrow$ `[authenticateUser, uploadImages, uploadImagesHandler]`.
+   - Route `POST /single` $\rightarrow$ `[authenticateUser, uploadSingleImage, uploadSingleImageHandler]`.
+3. **Mount in `server/src/index.ts`:**
+   - `import uploadRoutes from './routes/uploadRoutes';`
+   - `app.use('/api/v1/upload', uploadRoutes);`
+
+---
+
+## 4. Required Changes (Backend / Frontend / Database)
+- **Database:** None.
+- **Frontend:** None (API endpoint implementation).
+- **Backend:**
+  - `server/src/controllers/uploadController.ts` (NEW)
+  - `server/src/routes/uploadRoutes.ts` (NEW)
+  - `server/src/index.ts` (MODIFY: import and mount route)
+
+---
+
+## 5. Important Business Logic & Edge Cases
+- **Authentication Required:** Anonymous callers receive `401 Unauthorized` (`TOKEN_MISSING` / `INVALID_TOKEN`), protecting platform storage from unauthenticated scrapers and bots.
+- **Empty File Payload:** Request with valid token but empty `images` array receives `400 Bad Request` (`NO_FILES_PROVIDED`).
+- **Batch Atomicity & Cleanup:** If one image fails storage processing, any previously stored images in the current batch are automatically removed using `deleteFile(publicId)` before returning an error response.
+- **Full Metadata Return:** Returns both `urls: string[]` (for straightforward frontend form binding) and `images: StorageResult[]` (preserving `publicId` and `driver` for ad moderation and CDN tracking).
+- **Static URL Accessibility:** In local development, returned URLs (e.g. `/uploads/abc.png`) are immediately servable and fetchable via `GET http://localhost:5000/uploads/abc.png` (configured in Task 4.2).
+
+---
+
+## 6. Security, Validation & Error-Handling Requirements
+- JWT validation via `authenticateUser`.
+- MIME type and 5MB size limits enforced before memory storage.
+- Standard platform envelopes (`sendSuccess` with 201, `sendError` with 400/401/500).
+- Zero path traversal vulnerability (filenames generated collision-free via UUID in `LocalStorageDriver`).
+
+---
+
+## 7. Testing & Verification Steps
+Create an automated test probe (`server/test_media_upload_endpoint_probe.ts`) against the Express application:
+1. **Scenario 1 - Missing Auth:** Send `POST /api/v1/upload` without Bearer token; verify `401 Unauthorized`.
+2. **Scenario 2 - Missing Files:** Send `POST /api/v1/upload` with valid auth token but no multipart files; verify `400 Bad Request` (`NO_FILES_PROVIDED`).
+3. **Scenario 3 - Invalid MIME Type:** Send `POST /api/v1/upload` with a `.txt` file; verify `400 Bad Request` (`INVALID_FILE_TYPE`).
+4. **Scenario 4 - Valid Multi-Image Upload (2 images):** Send `POST /api/v1/upload` with 2 valid images (1 JPEG, 1 PNG); verify `201 Created`, array of 2 URLs returned, and verify physical files exist in `server/uploads/`.
+5. **Scenario 5 - Fetch Uploaded Files Statically:** Perform HTTP `GET` to the URLs returned in Scenario 4; verify status `200 OK` and exact byte content delivered.
+6. **Scenario 6 - Valid Single-Image Upload:** Send `POST /api/v1/upload/single` with 1 valid WebP image; verify `201 Created` with single image descriptor and URL.
+7. **Clean up disk fixtures & probe:** Delete test files from `server/uploads/` and remove probe script.
+8. **TypeScript Compilation:** Run `npm run build` in `server/` to confirm zero compilation or typing errors.
+
+---
+
+## 8. Definition of Done
+- `server/src/controllers/uploadController.ts` and `server/src/routes/uploadRoutes.ts` implemented.
+- Route mounted in `server/src/index.ts`.
+- All 6 automated verification scenarios pass with 100% success.
+- `npm run build` exits with code 0.
+- Phase 4 completed: `06_IMPLEMENTATION_ROADMAP.md` updated (overall progress $\rightarrow$ 46%), and `walkthrough.md` updated with full Phase 4 summary.
